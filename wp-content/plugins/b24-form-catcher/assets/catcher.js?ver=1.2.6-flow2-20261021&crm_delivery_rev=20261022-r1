@@ -1,0 +1,719 @@
+if ((window.B24FC||window.B24FZ||{}).flowProtocol===2) {
+(function () {
+    'use strict';
+    var cfg=window.B24FC || window.B24FZ;
+    if (!cfg || cfg.flowProtocol!==2 || window.FL19Client) return;
+    var isFz=!!window.B24FZ, states=new WeakMap(), forms=[], keyOwners=new Map();
+    var storePrefix='fl19-v2:'+location.pathname+':';
+    function randomFlow() {
+        if (!window.crypto || typeof window.crypto.getRandomValues!=='function') throw new Error('Обновите браузер для безопасной отправки.');
+        var a=new Uint8Array(isFz?24:16);window.crypto.getRandomValues(a);
+        if (!isFz) { a[6]=(a[6]&15)|64;a[8]=(a[8]&63)|128; }
+        var h=Array.from(a,function(n){return n.toString(16).padStart(2,'0');}).join('');
+        return isFz?h:h.slice(0,8)+'-'+h.slice(8,12)+'-'+h.slice(12,16)+'-'+h.slice(16,20)+'-'+h.slice(20);
+    }
+    function hidden(form,key,value) {
+        var el=form.querySelector('[name="'+key+'"]');
+        if (!el) { el=document.createElement('input');el.type='hidden';el.name=key;form.appendChild(el); }
+        el.value=value;
+    }
+    function persist(st) {
+        try { sessionStorage.setItem(st.key,JSON.stringify({flow:st.flow,created:st.created,phase:st.phase,lead:st.lead,eventSent:!!st.eventSent})); } catch (_) {}
+    }
+    function sync(form,st) {
+        hidden(form,'fl19_flow',st.flow);
+        hidden(form,isFz?'b24fz_session':(window.ajax_form_object?'b24fc_submission_id':'b24fc_session_id'),st.flow);
+        hidden(form,'b24fc_lead_id',String(st.lead||0));
+        hidden(form,'fl19_protocol','2');
+        persist(st);
+    }
+    function eligible(form) {
+        if(form&&form.closest&&form.closest('#nsvc-root')&&form.getAttribute('data-nsvc-enabled')==='1')return false;
+        return form && form.matches && form.matches('form.wpcf7-form,form.send-data,form.send-data2,form.form-send,form[data-fl19],form[action*="quiz-send.php"],.anketa-madal,.anketa_v1,.anketa_v2');
+    }
+    function stableKey(form) {
+        var unit=form.querySelector('[name="_wpcf7_unit_tag"]'),anchor=form.parentElement&&form.parentElement.closest('[id]');
+        if(form.id)return storePrefix+'id:'+form.id;
+        if(unit&&unit.value)return storePrefix+'cf7:'+unit.value;
+        var names=Array.from(form.querySelectorAll('input,textarea,select')).map(function(el){return el.name||'';}).filter(function(n){return n&&!/^fl19_|^b24fc_|^b24fz_/.test(n);}).sort();
+        var type=form.querySelector('[name="form_type"]'),kind=form.closest('.anketa_v1,.anketa_v2');
+        return storePrefix+'shape:'+JSON.stringify([anchor?anchor.id:'',String(form.action||''),String(form.className||''),type?type.value:'',kind?(kind.classList.contains('anketa_v2')?'v2':'v1'):'',names]);
+    }
+    function state(form) {
+        if (!eligible(form)) return null;
+        var st=states.get(form);if(st)return st;
+        var key=stableKey(form),saved=null,owner=keyOwners.get(key);
+        if(owner&&owner!==form&&owner.isConnected!==false)throw new Error('Не удалось подготовить форму. Обновите страницу или позвоните нам.');
+        keyOwners.set(key,form);
+        try { saved=JSON.parse(sessionStorage.getItem(key)); } catch (_) {}
+        if (!saved || !/^(?:[a-f0-9]{48}|[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})$/.test(saved.flow||'') || Date.now()-saved.created>=86400000 || window.opener) saved=null;
+        st={key:key,flow:saved?saved.flow:randomFlow(),created:saved?saved.created:Date.now(),phase:saved?saved.phase:'active',lead:saved?saved.lead:0,eventSent:saved?!!saved.eventSent:false,pending:Promise.resolve(),timer:null,sending:false};
+        states.set(form,st);forms.push(form);sync(form,st);return st;
+    }
+    function data(form) {
+        var d={};
+        form.querySelectorAll('input,select,textarea').forEach(function(el){
+            if (!el.name || el.disabled || ['button','submit','file'].indexOf(el.type)>=0 || ((el.type==='checkbox'||el.type==='radio')&&!el.checked)) return;
+            var v=String(el.value||'');
+            if(Object.prototype.hasOwnProperty.call(d,el.name)) {if(!Array.isArray(d[el.name]))d[el.name]=[d[el.name]];d[el.name].push(v);} else d[el.name]=v;
+        });
+        return d;
+    }
+    function contacts(form) {
+        var r={name:'',phone:'',email:''};
+        form.querySelectorAll('input,textarea').forEach(function(el){
+            if(el.disabled||el.type==='hidden')return;
+            var h=[el.type,el.name,el.id,el.placeholder].join(' ').toLowerCase(),v=String(el.value||'').trim();
+            if(!v)return;
+            if(el.type==='email'||/e-?mail|почт/.test(h)){if(!r.email)r.email=v;}
+            else if(el.type==='tel'||/phone|tel|телефон|номер/.test(h)){if(!r.phone)r.phone=v;}
+            else if(/name|имя|fio|фио/.test(h)){if(!r.name)r.name=v;}
+        });
+        return r;
+    }
+    function contactOk(c) { return (c.phone.replace(/\D/g,'').length>=10) || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c.email); }
+    function bounded(promise) {
+        return new Promise(function(resolve,reject){
+            var timer=setTimeout(function(){reject(new Error('Подтверждение задержалось. Данные сохранены, повторите отправку.'));},45000);
+            promise.then(function(v){clearTimeout(timer);resolve(v);},function(e){clearTimeout(timer);reject(e);});
+        });
+    }
+    function post(url,payload) {
+        return bounded(fetch(url,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json','X-WP-Nonce':cfg.nonce||''},body:JSON.stringify(payload),keepalive:true})).then(function(r){return r.json().then(function(j){if(!r.ok||j.ok===false)throw new Error('Заявка не подтверждена. Повторите отправку с этой страницы.');return j;});});
+    }
+    function payload(form,st) {
+        var d=data(form),c=contacts(form);
+        return Object.assign({},isFz?d:{},c,{page:location.href,url:location.href,referrer:document.referrer||'',fl19_flow:st.flow,lead_id:st.lead,session_id:st.flow,submission_id:st.flow,b24fz_session:st.flow,form_id:d._wpcf7||0,direction:d.direction||'',form:d.form||'',yaClientID:d.yaClientID||'',request_topic_form_key:d._wpcf7?'cf7:'+d._wpcf7:'',honeypot:d.b24fc_website||'',fl19_values:business(form)});
+    }
+    function draft(form) {
+        var st=state(form);if(!st||st.sending||st.phase==='final'||st.phase==='pending')return Promise.resolve(null);
+        if(form.closest('#nsvc-root'))return Promise.resolve(null);
+        var d=payload(form,st);if(!contactOk(d))return Promise.resolve(null);
+        if(isFz && (!cfg.forms[d.form_id] || !cfg.forms[d.form_id].draft))return Promise.resolve(null);
+        st.pending=st.pending.catch(function(){}).then(function(){
+            if(st.phase!=='active'||st.sending)return null;
+            return post(isFz?cfg.endpoint:cfg.root+'draft',d).then(function(j){
+                if(j.lead_id)st.lead=Number(j.lead_id);
+                if(j.receipt==='fl19-v2'&&(j.state==='final'||j.state==='submitted'))st.phase='final';
+                sync(form,st);return j;
+            });
+        });
+        return st.pending;
+    }
+    function prepare(form) {
+        var st=state(form);if(!st)return Promise.reject(new Error('Обновите страницу перед отправкой.'));
+        clearTimeout(st.timer);
+        return st.pending.catch(function(){}).then(function(){st.phase='pending';sync(form,st);return st;});
+    }
+    function confirm(form) {
+        var st=state(form);if(!st)return Promise.reject(new Error('Не найдена заявка.'));
+        return post('/wp-json/fl19/v2/status',{fl19_flow:st.flow}).then(function(j){
+            if(j.receipt!=='fl19-v2'||j.state!=='final'||!j.lead_id)throw new Error('CRM ещё не подтвердила заявку. Повторите отправку.');
+            st.phase='final';st.lead=Number(j.lead_id);sync(form,st);return j;
+        });
+    }
+    function confirmedEvent(form,receipt) {
+        var st=states.get(form);if(!st||st.eventSent)return;
+        st.eventSent=true;persist(st);
+        document.dispatchEvent(new CustomEvent('fl19:confirmed',{detail:{form:form,flow:st.flow,lead_id:receipt.lead_id}}));
+    }
+    function proofConfirmed(form,proof) {
+        if(!proof||proof.ok!==true||proof.receipt!=='fl19-v2'||!proof.lead_id||['final','submitted'].indexOf(proof.state)<0)return false;
+        var st=state(form);st.phase='final';st.lead=Number(proof.lead_id);st.sending=false;sync(form,st);calculatorDone(form);confirmedEvent(form,proof);return true;
+    }
+    function calculatorDone(form) {
+        var inside=form.querySelector('.send-data2.shortcode-calculator'),second=form.matches('.send-data2')||!!inside;
+        var scope=inside||form.closest(second?'.shortcode-calculator':'.section-calc,.section-6');
+        if(!scope)return;
+        var steps=Array.from(scope.querySelectorAll('.step'));
+        steps.forEach(function(el){el.classList.remove('active');});
+        if(second){if(steps.length)steps[steps.length-1].classList.add('active');}
+        else{
+            scope.querySelectorAll('.step.successtep').forEach(function(el){el.classList.add('active');});
+            scope.querySelectorAll('.total-flex .col-right').forEach(function(el){if(el.classList.contains('end')){el.classList.add('active');el.style.display='';}else el.style.display='none';});
+        }
+    }
+    function failed(form) {var st=states.get(form);if(st){st.sending=false;st.phase='pending';sync(form,st);form.classList.remove('submitting');form.setAttribute('data-status','failed');if(form.wpcf7)form.wpcf7.status='failed';}}
+    function message(form,text) {
+        var el=form.querySelector('.fl19-result');if(!el){el=document.createElement('div');el.className='fl19-result';el.setAttribute('role','status');form.appendChild(el);}el.textContent=text;
+    }
+    function route(form) {
+        var d=data(form),f=form.closest('.anketa_v1,.anketa_v2');
+        if(f)return {url:'/wp-content/themes/favorit/feedback/wi-feedback.php',kind:'feedback',quiz:f.classList.contains('anketa_v2')?'v2':'v1'};
+        if(form.matches('.wpcf7-form'))return {url:'/wp-json/contact-form-7/v1/contact-forms/'+encodeURIComponent(d._wpcf7)+'/feedback',kind:'cf7'};
+        if(form.matches('.send-data2'))return {url:'/sendFormData_newcalc.php',kind:'calc'};
+        if(form.matches('.send-data'))return {url:'/sendFormData.php',kind:'calc'};
+        if(form.matches('.form-send')&&window.ajax_form_object)return {url:ajax_form_object.url,kind:'fed'};
+        if(String(form.action||'').indexOf('quiz-send.php')>=0)return {url:form.action,kind:'quiz'};
+        return null;
+    }
+    function nativeBody(form,st,rt) {
+        var d=data(form),fd=form.tagName==='FORM'?new FormData(form):new FormData();
+        if(form.tagName!=='FORM')Object.keys(d).forEach(function(k){(Array.isArray(d[k])?d[k]:[d[k]]).forEach(function(v){fd.append(k,v);});});
+        fd.set('fl19_flow',st.flow);fd.set('b24fc_lead_id',String(st.lead||0));
+        fd.set('fl19_values',JSON.stringify(business(form)));
+        if(rt.kind==='quiz')fd.set('otprav','1');
+        if(rt.kind==='fed'){fd.set('action','ajax_preorder_callback');fd.set('nonce',ajax_form_object.nonce);fd.set('b24fc_submission_id',st.flow);}
+        if(rt.kind==='feedback'){
+            fd.set('action','feedback');fd.set('quiz_kind',rt.quiz);
+            var n=0;form.querySelectorAll('input,textarea,select').forEach(function(el){
+                if((!el.name&&!el.getAttribute('data-label'))||el.disabled||((el.type==='radio'||el.type==='checkbox')&&!el.checked)||/^fl19_|^b24fc_|^b24fz_/.test(el.name||''))return;
+                fd.append('fields['+n+'][name]',el.getAttribute('data-label')||el.name);fd.append('fields['+n+'][value]',el.value||'');n++;
+            });
+        }
+        return fd;
+    }
+    function business(form) {
+        var d=data(form),rt=route(form);
+        Object.keys(d).forEach(function(k){
+            if(/^(?:fl19_|b24fc_|b24fz_|_wpcf7|request_topic_|fedelis_|utm_)/.test(k)||/-time-(?:start|check)$/.test(k)||['session_id','submission_id','lead_id','nonce','_wpnonce','action','page','url','link','referrer','yaClientID','ym_client_id','form_id','otprav','g-recaptcha-response','rct'].indexOf(k)>=0)delete d[k];
+        });
+        if(rt&&rt.kind==='feedback'){
+            d.quiz_kind=rt.quiz;d.fields=[];
+            form.querySelectorAll('input,textarea,select').forEach(function(el){
+                if((!el.name&&!el.getAttribute('data-label'))||el.disabled||((el.type==='radio'||el.type==='checkbox')&&!el.checked)||/^fl19_|^b24fc_|^b24fz_/.test(el.name||''))return;
+                d.fields.push({name:el.getAttribute('data-label')||el.name,value:el.value||''});
+            });
+        }
+        return d;
+    }
+    function submit(form) {
+        var st=state(form),rt=route(form);if(!st||!rt)return Promise.reject(new Error('Обновите страницу перед отправкой.'));
+        if(st.sending)return st.submission;
+        if(st.phase==='final'){message(form,'Заявка уже принята.');return Promise.resolve(null);}
+        if(rt.kind==='feedback'){var invalid=Array.from(form.querySelectorAll('input,textarea,select')).find(function(el){return el.checkValidity&&!el.checkValidity();});if(invalid){if(invalid.reportValidity)invalid.reportValidity();return Promise.resolve(null);}}
+        if(form.checkValidity&&!form.checkValidity()){if(form.reportValidity)form.reportValidity();return Promise.resolve(null);}
+        st.sending=true;
+        st.submission=prepare(form).then(function(){
+            var fd=nativeBody(form,st,rt);
+            return fetch(rt.url,{method:'POST',credentials:'same-origin',body:fd,keepalive:true}).then(function(r){
+                if(!r.ok)throw new Error('Заявка не подтверждена. Повторите отправку.');
+                if(rt.kind==='cf7')return r.json().then(function(j){if(j.status!=='mail_sent')throw new Error(j.message||'Проверьте поля формы.');return j;});
+                if(rt.kind==='fed')return r.json().then(function(j){if(!j.success)throw new Error('Заявка не подтверждена.');return j;});
+                return r.text().then(function(t){if(rt.kind==='calc'&&t.trim()!=='success')throw new Error('Заявка не подтверждена.');if(rt.kind==='feedback'&&t.trim()!=='1')throw new Error('Письмо или заявка не подтверждены.');return t;});
+            });
+        }).then(function(){return confirm(form);}).then(function(j){
+            st.sending=false;confirmedEvent(form,j);message(form,'Заявка принята. Мы свяжемся с вами.');
+            if(rt.kind==='calc')calculatorDone(form);
+            if(rt.kind==='feedback')location.href=rt.quiz==='v2'?'/quiz-fizicheskie-thanks/':'/quiz-yridicheskie-thanks/';
+            if(rt.kind==='quiz')location.href='/quiz/quiz-thanks/';
+            return j;
+        }).catch(function(e){failed(form);message(form,e.message||'Не удалось подтвердить заявку. Повторите отправку.');return null;});
+        return st.submission;
+    }
+    function cf7Submit(e) {
+        var form=e.target,st=state(form);
+        if(form.__fl19Ready){form.__fl19Ready=false;return;}
+        e.preventDefault();e.stopImmediatePropagation();
+        if(st.sending)return;
+        if(st.phase==='final'){message(form,'Заявка уже принята.');return;}
+        st.sending=true;var submitter=e.submitter;
+        prepare(form).then(function(){
+            hidden(form,'fl19_values',JSON.stringify(business(form)));
+            if(typeof form.requestSubmit!=='function')throw new Error('Обновите браузер перед отправкой.');
+            // Leave the current native submit dispatch before resubmitting.
+            setTimeout(function(){form.__fl19Ready=true;form.requestSubmit(submitter||undefined);},0);
+        }).catch(function(err){form.__fl19Ready=false;failed(form);message(form,err.message);});
+    }
+    function transportForm(body) {
+        if(!body||typeof body.get!=='function')return null;
+        var flow=body.get('fl19_flow');return forms.find(function(f){var s=states.get(f);return s&&s.flow===flow;})||null;
+    }
+    function cf7TransportFailed(form) {
+        if(!form)return;failed(form);message(form,'Не удалось подтвердить заявку. Данные сохранены, повторите отправку.');
+    }
+    var originalFetch=window.fetch;
+    window.fetch=function(url,options){
+        var isCf7=/\/contact-form-7\/v1\/contact-forms\/\d+\/feedback/.test(String(url));
+        var ownNative=/\/(?:sendFormData(?:_newcalc)?\.php|quiz-send\.php|wp-admin\/admin-ajax\.php)|\/feedback\/wi-feedback\.php/.test(String(url));
+        var form=isCf7||ownNative?transportForm(options&&options.body):null;
+        var pending=originalFetch.apply(this,arguments);
+        // A timed-out request may still finish on the server. Keep the same flow.
+        if(form)pending=bounded(pending);
+        return pending.then(function(response){
+            if(form){
+                if(!response.ok)cf7TransportFailed(form);
+                else if(isCf7)response.clone().json().catch(function(){cf7TransportFailed(form);});
+            }
+            return response;
+        },function(error){cf7TransportFailed(form);throw error;});
+    };
+    if(window.jQuery){
+        var ajaxTimers=new WeakMap();
+        window.jQuery(document).ajaxSend(function(_e,xhr,settings){
+            if(!/\/contact-form-7\/v1\/contact-forms\/\d+\/feedback/.test(String(settings&&settings.url)))return;
+            var form=transportForm(settings.data);
+            if(form)ajaxTimers.set(xhr,setTimeout(function(){cf7TransportFailed(form);},45000));
+        }).ajaxError(function(_e,_xhr,settings){
+            if(/\/contact-form-7\/v1\/contact-forms\/\d+\/feedback/.test(String(settings&&settings.url)))cf7TransportFailed(transportForm(settings.data));
+        }).ajaxComplete(function(_e,xhr){var t=ajaxTimers.get(xhr);if(t){clearTimeout(t);ajaxTimers.delete(xhr);}});
+    }
+    function changed(e) {
+        var form=e.target.form || (e.target.closest&&e.target.closest('form,.anketa-madal,.anketa_v1,.anketa_v2'));
+        if(!eligible(form))return;var st=state(form);if(!st||st.sending)return;
+        var editing=['input','change','paste'].indexOf(e.type)>=0 || (e.type==='keyup'&&['Tab','Enter','Escape','Shift','Control','Alt','Meta','ArrowLeft','ArrowRight','ArrowUp','ArrowDown'].indexOf(e.key)<0);
+        var c=contacts(form),hasNewText=!!(c.name||c.phone||c.email);
+        if(st.phase==='final'&&editing&&hasNewText&&e.isTrusted!==false){st.flow=randomFlow();st.created=Date.now();st.phase='active';st.lead=0;st.eventSent=false;sync(form,st);}
+        if(st.phase!=='active')return;
+        clearTimeout(st.timer);st.timer=setTimeout(function(){draft(form).catch(function(){});},1200);
+    }
+    ['input','change','keyup','focusout','paste'].forEach(function(ev){document.addEventListener(ev,changed,true);});
+    document.addEventListener('submit',function(e){
+        if(!eligible(e.target)||!route(e.target))return;
+        if(e.target.matches('.wpcf7-form'))return cf7Submit(e);
+        e.preventDefault();e.stopImmediatePropagation();submit(e.target);
+    },true);
+    document.addEventListener('wpcf7mailsent',function(e){
+        var form=e.target.matches&&e.target.matches('form')?e.target:e.target.querySelector('form');
+        if(!form||!states.has(form))return;
+        var proof=e.detail&&e.detail.apiResponse&&e.detail.apiResponse.fl19;
+        if(proofConfirmed(form,proof)){message(form,'Заявка принята. Мы свяжемся с вами.');return;}
+        // A mixed server cohort cannot trigger old success/redirect listeners.
+        e.stopImmediatePropagation();
+        confirm(form).then(function(j){var s=states.get(form);s.sending=false;confirmedEvent(form,j);message(form,'Заявка принята. Мы свяжемся с вами.');}).catch(function(err){failed(form);message(form,err.message);});
+    },true);
+    ['wpcf7invalid','wpcf7spam','wpcf7mailfailed','wpcf7aborted'].forEach(function(type){document.addEventListener(type,function(e){
+        var form=e.target.matches&&e.target.matches('form')?e.target:e.target.querySelector('form');if(!form)return;
+        var proof=e.detail&&e.detail.apiResponse&&e.detail.apiResponse.fl19;
+        if(type==='wpcf7aborted'&&proof&&proof.ok===true&&proof.receipt==='fl19-v2'&&proof.duplicate){
+            if(proofConfirmed(form,proof))message(form,'Заявка уже принята.');else failed(form);
+        }else failed(form);
+    },true);});
+    document.addEventListener('click',function(e){
+        if(!e.target.closest)return;var b=e.target.closest('.an-submit.active,#an-sbm1,#an-sbm2');if(!b)return;
+        var f=b.closest('.anketa-madal,.anketa_v1,.anketa_v2');if(!eligible(f))return;e.preventDefault();e.stopImmediatePropagation();submit(f);
+    },true);
+    function scan(){document.querySelectorAll('form,.anketa-madal,.anketa_v1,.anketa_v2').forEach(function(f){if(eligible(f)){try{state(f);}catch(e){message(f,e.message);}}});}
+    window.FL19Client={prepare:prepare,confirm:confirm,failed:failed,submit:submit,draft:draft,flow:function(f){var s=state(f);return s?s.flow:'';},state:function(f){return states.get(f);},randomFlow:randomFlow};
+    window.B24FCatcher={prepareForSubmit:prepare,getLeadId:function(f){var s=f&&states.get(f);return s?s.lead:0;},clearAfterSubmit:function(f){return f?confirm(f):Promise.resolve(null);}};
+    window.B24FZClient={prepare:prepare,done:confirm,failed:failed};
+    // No unload capture: it must never mint a new flow or race finalization.
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',scan);else scan();
+    new MutationObserver(scan).observe(document.documentElement,{childList:true,subtree:true});
+})();
+
+} else {
+/**
+ * B24 Form Catcher — фронтенд.
+ *
+ * Что делает:
+ *  - следит за всеми <form> на странице;
+ *  - как только пользователь ввёл имя/email/телефон (и остановился на debounceMs),
+ *    шлёт черновик на /draft. B24 создаёт лид "черновик", ID кладём в localStorage;
+ *  - при доборе полей тот же лид ОБНОВЛЯЕТСЯ (дублей нет);
+ *  - при отправке формы (native submit или CF7 wpcf7mailsent) шлёт /finalize —
+ *    метка "черновик" снимается;
+ *  - при закрытии вкладки досылает последний черновик через navigator.sendBeacon.
+ *
+ * Требует объект B24FC (root, nonce, requireConsent, debounceMs) из wp_localize_script.
+ */
+(function () {
+	'use strict';
+
+	if (typeof window.B24FC === 'undefined') {
+		return;
+	}
+
+	var CFG = window.B24FC;
+	var LS_LEAD = 'b24fc_lead_id';       // ID черновика лида
+	var LS_SESSION = 'b24fc_draft_session'; // один незавершённый лид на браузерный сеанс
+	var finalized = false;               // форма отправлена — поздний черновик не восстанавливает id
+	var pendingDrafts = new WeakMap();    // активный /draft для конкретной формы
+	var draftQueue = Promise.resolve();   // не даём нескольким формам одновременно создать лид
+	var queuedDrafts = 0;
+
+	/* --------- согласие ---------
+	 * Согласие считается данным по факту нахождения на сайте (баннер лишь информирует).
+	 * Кнопку жать не нужно — перехват работает сразу.
+	 */
+	function hasConsent() {
+		return true;
+	}
+
+	/* --------- хранилище ID лида --------- */
+	function getLeadId() {
+		try { return parseInt(localStorage.getItem(LS_LEAD) || '0', 10) || 0; }
+		catch (e) { return 0; }
+	}
+	function setLeadId(id) {
+		try {
+			if (id) localStorage.setItem(LS_LEAD, String(id));
+			else localStorage.removeItem(LS_LEAD);
+		} catch (e) {}
+		syncLeadIdToForms(id);
+	}
+
+	function makeSessionId() {
+		if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+			return window.crypto.randomUUID();
+		}
+		return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2) +
+			'-' + Math.random().toString(36).slice(2);
+	}
+
+	function getSessionId() {
+		try {
+			var id = localStorage.getItem(LS_SESSION) || '';
+			if (!id) {
+				id = makeSessionId();
+				localStorage.setItem(LS_SESSION, id);
+			}
+			return id;
+		} catch (e) {
+			if (!window.__b24fcSession) window.__b24fcSession = makeSessionId();
+			return window.__b24fcSession;
+		}
+	}
+
+	function clearAfterSubmit() {
+		setLeadId(0);
+		try { localStorage.removeItem(LS_SESSION); } catch (e) {}
+		window.__b24fcSession = '';
+	}
+
+	/* Прячем lead_id черновика скрытым полем во все формы. Тогда при реальной
+	 * отправке внешний интегратор получит его в payload и обновит ТОТ ЖЕ лид
+	 * (crm.lead.update), а не создаст второй — дублей между плагином и интегратором нет. */
+	function syncLeadIdToForms(id) {
+		var forms = document.querySelectorAll('form');
+		for (var i = 0; i < forms.length; i++) {
+			var inp = forms[i].querySelector('input[name="b24fc_lead_id"]');
+			if (!inp) {
+				inp = document.createElement('input');
+				inp.type = 'hidden';
+				inp.name = 'b24fc_lead_id';
+				forms[i].appendChild(inp);
+			}
+			inp.value = id ? String(id) : '';
+
+			var hp = forms[i].querySelector('input[name="b24fc_website"]');
+			if (!hp) {
+				hp = document.createElement('input');
+				hp.type = 'text';
+				hp.name = 'b24fc_website';
+				hp.value = '';
+				hp.tabIndex = -1;
+				hp.autocomplete = 'off';
+				hp.setAttribute('aria-hidden', 'true');
+				hp.style.position = 'absolute';
+				hp.style.left = '-10000px';
+				hp.style.width = '1px';
+				hp.style.height = '1px';
+				hp.style.opacity = '0';
+				forms[i].appendChild(hp);
+			}
+		}
+	}
+
+	/* --------- детект полей формы --------- */
+	// Ищем поля по type, name, id, placeholder, autocomplete — без привязки к плагину.
+	function detectFields(form) {
+		var res = { name: '', email: '', phone: '', honeypot: '' };
+		var hp = form.querySelector('input[name="b24fc_website"]');
+		res.honeypot = hp ? (hp.value || '').trim() : '';
+		var inputs = form.querySelectorAll('input, textarea');
+
+		inputs.forEach(function (el) {
+			if (el.disabled || el.type === 'hidden' || el.type === 'submit' || el.type === 'button') return;
+			var v = (el.value || '').trim();
+			if (!v) return;
+
+			var hay = [el.type, el.name, el.id, el.placeholder, el.getAttribute('autocomplete')]
+				.join(' ').toLowerCase();
+
+			if (el.type === 'email' || /e-?mail|почт|mail/.test(hay)) {
+				if (!res.email && /\S+@\S+\.\S+/.test(v)) res.email = v;
+				return;
+			}
+			if (el.type === 'tel' || /phone|tel|телефон|моб|whats|номер/.test(hay)) {
+				if (!res.phone) res.phone = v;
+				return;
+			}
+			if (/name|имя|fio|фио|contact|представ/.test(hay)) {
+				if (!res.name) res.name = v;
+				return;
+			}
+			// эвристика: значение похоже на email/телефон, даже если поле не размечено
+			if (!res.email && /\S+@\S+\.\S+/.test(v)) { res.email = v; return; }
+			if (!res.phone && /^[\d\s()+\-]{6,}$/.test(v)) { res.phone = v; return; }
+		});
+		// Направление/отдел и источник — из скрытых полей формы (fedelis: direction, url, form).
+		var d = form.querySelector('input[name="direction"]');
+		res.direction = d ? (d.value || '') : '';
+		var fn = form.querySelector('input[name="form"]');
+		res.form = fn ? (fn.value || '') : '';
+		var ya = form.querySelector('input[name="yaClientID"]');
+		res.yaClientID = ya ? (ya.value || '') : '';
+		var topicCode = form.querySelector('input[name="request_topic_code"]');
+		var topicName = form.querySelector('input[name="request_topic_name"]');
+		var cf7Id = form.querySelector('input[name="_wpcf7"]');
+		res.request_topic_code = topicCode ? (topicCode.value || '') : '';
+		res.request_topic_name = topicName ? (topicName.value || '') : '';
+		res.request_topic_form_key = cf7Id && cf7Id.value ? 'cf7:' + cf7Id.value : '';
+		// Недопечатанный телефон (меньше 10 цифр) не отправляем вовсе:
+		// иначе в CRM попадает обрубок «+7989», по которому стреляет СМС-робот.
+		if (res.phone && res.phone.replace(/[^\d]/g, '').length < 10) res.phone = '';
+		return res;
+	}
+
+	function hasSomething(f) {
+		if (f.honeypot) return false;
+		// Черновик имеет смысл, только когда есть КУДА связаться:
+		// полный телефон (≥10 цифр) или валидный email. Одного имени мало.
+		return (f.email && /\S+@\S+\.\S+/.test(f.email)) ||
+			(f.phone && f.phone.replace(/[^\d]/g, '').length >= 10);
+	}
+
+	/* --------- сеть --------- */
+
+	function deliveryFailure(form) {
+		if (!form || !form.querySelector || !form.appendChild) return;
+		var el = form.querySelector('[data-b24fc-status]');
+		if (!el) { el = document.createElement('p'); el.setAttribute('data-b24fc-status', '1'); el.setAttribute('role', 'alert'); form.appendChild(el); }
+		el.textContent = 'Отправка не подтверждена. Сохраните введённый текст. Если ошибка повторяется, свяжитесь с нами по телефону на сайте.';
+	}
+	function post(path, data) {
+		return fetch(CFG.root + path, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'X-WP-Nonce': CFG.nonce
+			},
+			body: JSON.stringify(data),
+			keepalive: true
+		}).then(function (r) { return r.json().then(function(data){ if (r.status === 400 && data && data.code === 'rest_invalid_json') data={ok:false,reason:'rest_invalid_json'}; if (!r.ok && (!data || data.ok !== false)) return null; if (data && typeof data === 'object') data.__b24fcHttpStatus=r.status; return data; }); }).catch(function () { return null; });
+	}
+
+	function sendDraft(fields) {
+		var payload = {
+			name: fields.name,
+			email: fields.email,
+			phone: fields.phone,
+			direction: fields.direction || '',
+			form: fields.form || '',
+			yaClientID: fields.yaClientID || '',
+			request_topic_code: fields.request_topic_code || '',
+			request_topic_name: fields.request_topic_name || '',
+			request_topic_form_key: fields.request_topic_form_key || '',
+			page: location.href,
+			referrer: document.referrer || '',
+			lead_id: getLeadId(),
+			session_id: getSessionId(),
+			honeypot: fields.honeypot || ''
+		};
+		return post('draft', payload).then(function (res) {
+			if (finalized) return res; // форму уже отправили — не воскрешаем черновик
+			if (res && res.ok && res.lead_id) setLeadId(res.lead_id);
+			return res;
+		});
+	}
+
+	function sendDraftForForm(form, fields) {
+		var pending = pendingDrafts.get(form);
+		if (pending) return pending;
+
+		queuedDrafts++;
+		pending = draftQueue.then(function () {
+			return sendDraft(fields);
+		}, function () {
+			return sendDraft(fields);
+		});
+		draftQueue = pending.catch(function () { return null; });
+		pendingDrafts.set(form, pending);
+		var clear = function (res) {
+			form.__b24fcDraftOutcome = res && res.ok === true && Number.isInteger(res.lead_id) && res.lead_id > 0 ? 'confirmed' : res && res.ok === false && ((res.reason === 'bad_nonce' && res.__b24fcHttpStatus === 403) || (res.reason === 'empty' && res.__b24fcHttpStatus === 200) || (res.reason === 'rest_invalid_json' && res.__b24fcHttpStatus === 400)) ? 'rejected_before_write' : 'unknown';
+			if (pendingDrafts.get(form) === pending) pendingDrafts.delete(form);
+			queuedDrafts = Math.max(0, queuedDrafts - 1);
+			return res;
+		};
+		return pending.then(clear, function () { return clear(null); });
+	}
+
+	function sendFinalize(fields, form) {
+		var id = getLeadId();
+		return post('finalize', {
+			name: fields.name,
+			email: fields.email,
+			phone: fields.phone,
+			direction: fields.direction || '',
+			form: fields.form || '',
+			yaClientID: fields.yaClientID || '',
+			request_topic_code: fields.request_topic_code || '',
+			request_topic_name: fields.request_topic_name || '',
+			request_topic_form_key: fields.request_topic_form_key || '',
+			page: location.href,
+			referrer: document.referrer || '',
+			lead_id: id,
+			session_id: getSessionId()
+		}).then(function (res) {
+			if (res && res.ok === true && Number.isInteger(res.lead_id) && res.lead_id > 0) {
+				clearAfterSubmit();
+			} else {
+				deliveryFailure(form);
+			}
+			return res;
+		});
+	}
+
+	/* --------- подключение к формам --------- */
+	var timers = new WeakMap();
+
+	function cancelScheduledDraft(form) {
+		var t = timers.get(form);
+		if (t) clearTimeout(t);
+		timers.delete(form);
+	}
+
+	/**
+	 * Перед финальной отправкой дожидаемся уже начатого /draft или создаём
+	 * черновик сразу. После этого b24fc_lead_id гарантированно попадает в FormData,
+	 * а внешний интегратор обновляет тот же лид вместо создания второго.
+	 */
+	function prepareForSubmit(form) {
+		cancelScheduledDraft(form);
+		var pending = pendingDrafts.get(form);
+		var ready = pending || Promise.resolve(null);
+
+		return ready.then(function () {
+			var id = getLeadId();
+			if (id) return id;
+
+			var f = detectFields(form);
+			if (!hasSomething(f)) { form.__b24fcDraftOutcome='not_attempted'; return 0; }
+			form.__b24fcLast = f;
+			finalized = false;
+			return sendDraftForForm(form, f).then(function (res) {
+				return res && res.ok && res.lead_id ? parseInt(res.lead_id, 10) || 0 : getLeadId();
+			});
+		}).then(function (id) {
+			finalized = true;
+			cancelScheduledDraft(form);
+			syncLeadIdToForms(id || 0);
+			return id || 0;
+		});
+	}
+
+	function attach(form) {
+		if (form.closest("#nsvc-root") && form.getAttribute("data-nsvc-enabled") === "1") return; // task14: final submit owns this batch
+		if (form.__b24fcBound) return;
+		form.__b24fcBound = true;
+
+		function schedule() {
+			if (!hasConsent()) return;
+			finalized = false; // пользователь снова печатает — начинается новый черновик
+			var t = timers.get(form);
+			if (t) clearTimeout(t);
+			t = setTimeout(function () {
+				var f = detectFields(form);
+				if (hasSomething(f)) {
+					form.__b24fcLast = f;
+					sendDraftForForm(form, f);
+				}
+			}, CFG.debounceMs || 1500);
+			timers.set(form, t);
+		}
+
+		form.addEventListener('input', schedule, true);
+		form.addEventListener('change', schedule, true);
+		// Маски телефона (jquery.inputmask на favorit) перехватывают клавиши и меняют
+		// value программно — нативный 'input' не диспатчится. keyup/focusout/paste
+		// маска не глушит, поэтому дублируем планировщик на них.
+		form.addEventListener('keyup', schedule, true);
+		form.addEventListener('focusout', schedule, true);
+		form.addEventListener('paste', schedule, true);
+
+		// Обычная отправка формы.
+		form.addEventListener('submit', function () {
+			// Если финализацию делает внешний интегратор (он получит lead_id
+			// скрытым полем и обновит тот же лид) — плагин сам лид не трогает,
+			// но после отправки сбрасывает черновик, чтобы СЛЕДУЮЩАЯ заявка
+			// не перезаписала уже завершённый лид. setTimeout(0) — чтобы интегратор
+			// успел синхронно считать lead_id из формы до очистки.
+			if (CFG.externalFinalize) {
+				finalized = true;
+				var pend = timers.get(form);
+				if (pend) clearTimeout(pend); // не запускаем новый черновик после отправки
+				// State is cleared only after an accepted CF7 response, not the submit event.
+				return;
+			}
+			// CF7 шлёт submit через AJAX и вызывает его ДАЖЕ при неудачной валидации.
+			// Для CF7 финализируем только по успешному wpcf7mailsent (ниже), иначе
+			// недоотправленный лид ошибочно помечался бы "заполнено".
+			if (form.classList.contains('wpcf7-form') || form.closest('.wpcf7')) return;
+			var f = detectFields(form);
+			if (hasSomething(f) || getLeadId()) sendFinalize(f, form);
+		}, true);
+	}
+
+	function scan() {
+		document.querySelectorAll('form').forEach(attach);
+		syncLeadIdToForms(getLeadId());
+	}
+
+	/* --------- Contact Form 7 --------- */
+	// CF7 отправляет через AJAX; успешная отправка = событие wpcf7mailsent.
+	document.addEventListener('wpcf7mailsent', function (e) {
+
+		// e.target — обёртка .wpcf7; сама форма (и её __b24fcLast) внутри.
+		var wrap = e.target && e.target.querySelector ? e.target : document;
+		var formEl = (wrap.matches && wrap.matches('form')) ? wrap
+			: (wrap.querySelector ? wrap.querySelector('form') : null);
+		// Берём последние захваченные значения черновика; CF7 к этому моменту
+		// мог уже очистить поля, поэтому detectFields — только запасной вариант.
+		if (CFG.externalFinalize) {
+			var response = e.detail && e.detail.apiResponse;
+			if (response && response.status === 'mail_sent' && (!response.fl19 || (response.fl19.ok === true && Number.isInteger(response.fl19.lead_id) && response.fl19.lead_id > 0))) clearAfterSubmit();
+			return;
+		}
+		var f = (formEl && formEl.__b24fcLast) || detectFields(formEl || wrap);
+		if (hasSomething(f) || getLeadId()) sendFinalize(f, formEl);
+	}, false);
+
+	/* --------- досыл при закрытии вкладки --------- */
+	window.addEventListener('beforeunload', function () {
+		if (!hasConsent()) return;
+		// Активный keepalive-запрос уже дойдёт до сервера. Второй beacon в этот
+		// момент раньше создавал параллельный лид с теми же данными.
+		if (queuedDrafts > 0) return;
+		var forms = document.querySelectorAll('form');
+		for (var i = 0; i < forms.length; i++) {
+			if (forms[i].closest("#nsvc-root") && forms[i].getAttribute("data-nsvc-enabled") === "1") continue; // task14: no duplicate unload draft
+			var f = detectFields(forms[i]);
+			if (hasSomething(f)) {
+				var blob = new Blob([JSON.stringify({
+					name: f.name, email: f.email, phone: f.phone,
+					direction: f.direction || '', form: f.form || '', yaClientID: f.yaClientID || '',
+					request_topic_code: f.request_topic_code || '',
+					request_topic_name: f.request_topic_name || '',
+					request_topic_form_key: f.request_topic_form_key || '',
+					page: location.href, referrer: document.referrer || '',
+					lead_id: getLeadId(), session_id: getSessionId(),
+					honeypot: f.honeypot || '', _wpnonce: CFG.nonce
+				})], { type: 'application/json' });
+				// sendBeacon не шлёт кастомные заголовки, поэтому nonce идёт в теле;
+				// сервер принимает nonce и из заголовка, и из тела (см. PHP при желании расширить).
+				try { navigator.sendBeacon(CFG.root + 'draft', blob); } catch (e2) {}
+				break;
+			}
+		}
+	});
+
+	/* --------- init --------- */
+	if (document.readyState === 'loading') {
+		document.addEventListener('DOMContentLoaded', scan);
+	} else {
+		scan();
+	}
+	// Формы, добавленные динамически (попапы, Elementor и т.п.).
+	var mo = new MutationObserver(scan);
+	mo.observe(document.documentElement, { childList: true, subtree: true });
+
+	window.B24FCatcher = {
+		prepareForSubmit: prepareForSubmit,
+		getLeadId: getLeadId,
+		draftOutcome: function(form) { return form.__b24fcDraftOutcome || 'unknown'; },
+		clearAfterSubmit: clearAfterSubmit
+	};
+})();
+
+}
