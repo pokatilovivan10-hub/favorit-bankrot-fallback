@@ -1,6 +1,5 @@
-# Favorit Consult — static backup
+# Favorit Bankrot — static backup
 
-Snapshot of the public home page at `https://favorit-consult.ru/`, created on 2026-10-28.
+Snapshot of the public page at `https://favorit-bankrot.ru/`, created on 2026-10-28.
 
-Includes the rendered HTML and 278 referenced static assets required by the home page.
-This is a static archive: WordPress search, lead forms, and other server-side features continue to require the original site backend and are not functional from a static host.
+The page is built in Tilda and references Tilda CDN assets. Its submission form depends on the original Tilda backend and is not functional when opened from a static archive.
