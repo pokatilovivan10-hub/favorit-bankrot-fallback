@@ -48,7 +48,10 @@ export default {
         SOURCE_DESCRIPTION: "Иван Покатилов",
       };
 
-      const bitrixUrl = new URL("crm.lead.add.json", env.BITRIX_WEBHOOK_URL);
+      const webhookBase = env.BITRIX_WEBHOOK_URL.endsWith("/")
+        ? env.BITRIX_WEBHOOK_URL
+        : `${env.BITRIX_WEBHOOK_URL}/`;
+      const bitrixUrl = new URL("crm.lead.add.json", webhookBase);
       const bitrixResponse = await fetch(bitrixUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
