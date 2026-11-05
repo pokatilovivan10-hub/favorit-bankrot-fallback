@@ -349,4 +349,31 @@ document.addEventListener('DOMContentLoaded', function () {
   }, true);
 });
 </script>
+<script>
+(function () {
+  var blockedWidgetHost = /(?:envybox|whitesaas|callbackkiller)/i;
+  var appendChild = Node.prototype.appendChild;
+
+  Node.prototype.appendChild = function (node) {
+    if (node && node.tagName === 'SCRIPT' && blockedWidgetHost.test(node.src || '')) {
+      return node;
+    }
+
+    return appendChild.call(this, node);
+  };
+
+  function removeCallbackWidgets() {
+    document.querySelectorAll('[id*="envybox" i], [id*="callbackkiller" i], [class*="ws-chat" i], [class*="ws-callback" i], [class*="callbackkiller" i], iframe[src*="envybox" i], iframe[src*="whitesaas" i]').forEach(function (widget) {
+      widget.remove();
+    });
+  }
+
+  new MutationObserver(removeCallbackWidgets).observe(document.documentElement, {
+    childList: true,
+    subtree: true
+  });
+
+  removeCallbackWidgets();
+}());
+</script>
 </body> </html>
